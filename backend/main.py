@@ -6,7 +6,9 @@ import os
 import io
 import uuid
 import logging
-from typing import Optional, List
+import shutil
+from typing import Optional, List, Any
+from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -15,15 +17,15 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
 
-from models import (
-    init_db, get_db, Project, SeedImage, GeneratedImage,
-    ProjectStatus, SessionLocal
-)
-from storage import upload_bytes, get_presigned_url, ensure_bucket, upload_file
-from tasks import celery_app, train_lora_task, full_pipeline_task
+from storage import upload_bytes, get_presigned_url, upload_file
+from tasks import train_lora_task, full_pipeline_task
 from services.adversarial_agent import run_vulnerability_scan, STRESSORS
+import httpx
+
+from models import get_db, Project, SeedImage, ProjectStatus, init_db
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import desc
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,16 +33,17 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting BlindSpot.AI API...")
+    # Startup: Ensure local database is ready
     init_db()
-    ensure_bucket()
+    logger.info("Local SQLite Database Initialized")
     yield
+    # Shutdown: Clean up any open streams
     logger.info("Shutting down BlindSpot.AI API")
 
 
 app = FastAPI(
     title="BlindSpot.AI API",
-    description="Industrial-grade synthetic data generation for AI robustness",
+    description="Industrial-grade synthetic data generation for AI robustness (Local Mode)",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -70,6 +73,13 @@ class ProjectUpdate(BaseModel):
 class ModelEndpointRequest(BaseModel):
     endpoint: str
 
+class SeedImageResponse(BaseModel):
+    id: str
+    filename: str
+    url: str
+    class Config:
+        from_attributes = True
+
 class ProjectResponse(BaseModel):
     id: str
     name: str
@@ -82,78 +92,53 @@ class ProjectResponse(BaseModel):
     dataset_url: Optional[str]
     image_count: int
     label_count: int
-    seed_images: List[dict] = []
-    created_at: Optional[str]
-    updated_at: Optional[str]
+    seed_images: List[SeedImageResponse] = []
+    created_at: Optional[Any]
+    updated_at: Optional[Any]
 
     class Config:
         from_attributes = True
-
-
-def _project_to_dict(p: Project) -> dict:
-    return {
-        "id": p.id,
-        "name": p.name,
-        "description": p.description,
-        "status": p.status.value if p.status else "created",
-        "progress": p.progress or 0,
-        "current_stage": p.current_stage,
-        "model_endpoint": p.model_endpoint,
-        "vulnerability_vector": p.vulnerability_vector,
-        "dataset_url": p.dataset_url,
-        "image_count": p.image_count or 0,
-        "label_count": p.label_count or 0,
-        "seed_images": [
-            {"id": si.id, "filename": si.filename, "url": si.url}
-            for si in p.seed_images
-        ],
-        "created_at": p.created_at.isoformat() if p.created_at else None,
-        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
-    }
 
 
 # ─── Projects ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "BlindSpot.AI API"}
+    return {"status": "ok", "service": "BlindSpot.AI API (Local Mode)"}
 
 
-@app.post("/api/projects")
-def create_project(body: ProjectCreate, db: Session = Depends(get_db)):
+@app.post("/api/projects", response_model=ProjectResponse)
+def create_project_endpoint(body: ProjectCreate, db: Session = Depends(get_db)):
     project = Project(
-        id=str(uuid.uuid4()),
         name=body.name,
         description=body.description,
         status=ProjectStatus.CREATED,
-        progress=0,
+        progress=0
     )
     db.add(project)
     db.commit()
     db.refresh(project)
-    logger.info(f"Created project: {project.id} — {project.name}")
-    return _project_to_dict(project)
+    return project
 
 
-@app.get("/api/projects")
-def list_projects(db: Session = Depends(get_db)):
-    projects = db.query(Project).order_by(Project.created_at.desc()).all()
-    return [_project_to_dict(p) for p in projects]
+@app.get("/api/projects", response_model=List[ProjectResponse])
+def list_projects_endpoint(db: Session = Depends(get_db)):
+    return db.query(Project).order_by(desc(Project.created_at)).all()
 
 
-@app.get("/api/projects/{project_id}")
-def get_project(project_id: str, db: Session = Depends(get_db)):
-    project = db.query(Project).filter(Project.id == project_id).first()
+@app.get("/api/projects/{project_id}", response_model=ProjectResponse)
+def get_project_endpoint(project_id: str, db: Session = Depends(get_db)):
+    project = db.query(Project).options(joinedload(Project.seed_images)).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    return _project_to_dict(project)
+    return project
 
 
 @app.delete("/api/projects/{project_id}")
-def delete_project(project_id: str, db: Session = Depends(get_db)):
+def delete_project_endpoint(project_id: str, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+         raise HTTPException(status_code=404, detail="Project not found")
     db.delete(project)
     db.commit()
     return {"deleted": True}
@@ -162,38 +147,40 @@ def delete_project(project_id: str, db: Session = Depends(get_db)):
 # ─── Seed Images ──────────────────────────────────────────────────────────────
 
 @app.post("/api/projects/{project_id}/seed-images")
-async def upload_seed_images(
+async def upload_seed_images_endpoint(
     project_id: str,
     files: List[UploadFile] = File(...),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db)
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if len(files) < 1 or len(files) > 10:
-        raise HTTPException(status_code=400, detail="Upload between 1 and 10 seed images")
-
     uploaded = []
     for file in files:
         data = await file.read()
         ext = Path(file.filename).suffix or ".jpg"
-        storage_key = f"seeds/{project_id}/{uuid.uuid4().hex}{ext}"
-        upload_bytes(data, storage_key, content_type=file.content_type or "image/jpeg")
-        url = get_presigned_url(storage_key)
+        storage_key = f"project-seeds/{project_id}/{uuid.uuid4().hex}{ext}"
+        
+        upload_bytes(data, storage_key, content_type=file.content_type)
+        url = f"http://localhost:8000/media/{storage_key}"
 
         seed = SeedImage(
             project_id=project_id,
             filename=file.filename,
             storage_key=storage_key,
-            url=url,
+            url=url
         )
         db.add(seed)
-        uploaded.append({"filename": file.filename, "storage_key": storage_key, "url": url})
+        uploaded.append(seed)
 
     db.commit()
-    logger.info(f"Uploaded {len(uploaded)} seed images to project {project_id}")
-    return {"uploaded": len(uploaded), "images": uploaded}
+    
+    # Update project image count
+    project.image_count = db.query(SeedImage).filter(SeedImage.project_id == project_id).count()
+    db.commit()
+    
+    return {"uploaded": len(uploaded), "message": "Images uploaded successfully"}
 
 
 # ─── Model Endpoint ───────────────────────────────────────────────────────────
@@ -203,6 +190,7 @@ def set_model_endpoint(project_id: str, body: ModelEndpointRequest, db: Session 
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    
     project.model_endpoint = body.endpoint
     db.commit()
     return {"endpoint": body.endpoint, "message": "Model endpoint registered"}
@@ -215,79 +203,108 @@ def trigger_lora_training(project_id: str, background_tasks: BackgroundTasks, db
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    
     if not project.seed_images:
         raise HTTPException(status_code=400, detail="No seed images uploaded")
 
     storage_keys = [si.storage_key for si in project.seed_images]
-    background_tasks.add_task(train_lora_task.delay, project_id, storage_keys)
-    project.celery_task_id = "local-bg-task-lora"
+    
     project.status = ProjectStatus.TRAINING_LORA
+    project.current_stage = "Starting LoRA training..."
     db.commit()
 
-    return {"task_id": "local-bg-task-lora", "message": "LoRA training started"}
+    background_tasks.add_task(train_lora_task.delay, project_id, storage_keys)
+    
+    return {"message": "LoRA training started"}
 
 
 # ─── Adversarial Scan ─────────────────────────────────────────────────────────
 
 def run_scan_bg(project_id, model_endpoint, seed_paths):
-    from models import SessionLocal
+    from models import SessionLocal as SessionMakerLocal
+    from sqlalchemy.orm import Session as SessionType
+    
+    db: SessionType = SessionMakerLocal()
     try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project: return
+
         v_vec = run_vulnerability_scan(project_id, model_endpoint, seed_paths)
-        db = SessionLocal()
-        p = db.query(Project).filter(Project.id == project_id).first()
-        if p:
-            p.vulnerability_vector = v_vec
-            p.status = ProjectStatus.CREATED
-            p.current_stage = f"Scan complete — {len(v_vec)} blind spots found"
-            db.commit()
-        db.close()
+        
+        project.vulnerability_vector = v_vec
+        project.status = ProjectStatus.READY
+        project.current_stage = f"Scan complete — {len(v_vec)} blind spots found"
+        db.commit()
     except Exception as e:
         logger.error(f"Scan failed: {e}")
+        if project:
+            project.status = ProjectStatus.READY
+            project.error_message = str(e)
+            db.commit()
+    finally:
+        db.close()
 
 @app.post("/api/projects/{project_id}/run-adversarial-scan")
 def run_adversarial_scan_endpoint(project_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-
+    
     project.status = ProjectStatus.SCANNING
     project.current_stage = "Running adversarial scan..."
     db.commit()
 
+    # Prepare seeds
     seed_paths = []
-    tmp_dir = Path("/tmp") / f"scan_{project_id}"
-    tmp_dir.mkdir(exist_ok=True)
+    tmp_dir = Path("data") / f"scan_{project_id}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    from storage import download_file
     for i, si in enumerate(project.seed_images[:5]):
         local = str(tmp_dir / f"seed_{i}.jpg")
         try:
-            download_file(si.storage_key, local)
+            # Files are local
+            shutil.copy(os.path.join(os.path.dirname(__file__), "data", si.storage_key), local)
             seed_paths.append(local)
         except Exception as e:
-            logger.warning(f"Could not download seed image: {e}")
+            logger.warning(f"Could not copy seed image: {e}")
 
     background_tasks.add_task(run_scan_bg, project_id, project.model_endpoint or "", seed_paths)
 
-    return {"message": "Scan started in background"}
+    return {"message": "Scan started"}
 
 
 # ─── Full Generation Pipeline ─────────────────────────────────────────────────
+
+@app.patch("/api/projects/{project_id}/status")
+def update_project_status(project_id: str, payload: dict, db: Session = Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    for key, value in payload.items():
+        if hasattr(project, key):
+            setattr(project, key, value)
+    
+    db.commit()
+    return {"status": "success"}
 
 @app.post("/api/projects/{project_id}/generate")
 def trigger_generation(project_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    
+    if project.status in [ProjectStatus.GENERATING, ProjectStatus.TRAINING_LORA, ProjectStatus.SCANNING, ProjectStatus.LABELING]:
+        return {"message": "Pipeline already active", "status": project.status}
 
-    background_tasks.add_task(full_pipeline_task.delay, project_id)
-    project.celery_task_id = "local-bg-task-gen"
     project.status = ProjectStatus.GENERATING
     project.progress = 0
     project.current_stage = "Pipeline queued..."
     db.commit()
 
-    return {"task_id": "local-bg-task-gen", "message": "Generation pipeline started"}
+    background_tasks.add_task(full_pipeline_task.delay, project_id)
+
+    return {"message": "Generation pipeline started"}
 
 
 # ─── Status ───────────────────────────────────────────────────────────────────
@@ -297,25 +314,14 @@ def get_status(project_id: str, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-
-    celery_state = None
-    if project.celery_task_id:
-        try:
-            # If eager mode, this might throw NotImplementedError without backend
-            task_result = celery_app.AsyncResult(project.celery_task_id)
-            celery_state = task_result.state
-        except Exception as e:
-            logger.warning(f"Skipping celery state fetch (local mode): {e}")
-            celery_state = "unknown"
-
+    
     return {
         "project_id": project_id,
-        "status": project.status.value if project.status else "created",
-        "progress": project.progress or 0,
+        "status": project.status,
+        "progress": project.progress,
         "current_stage": project.current_stage,
-        "celery_state": celery_state,
-        "image_count": project.image_count or 0,
-        "label_count": project.label_count or 0,
+        "image_count": project.image_count,
+        "label_count": project.label_count,
         "error_message": project.error_message,
     }
 
@@ -327,26 +333,17 @@ def get_dataset(project_id: str, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    
     if project.status != ProjectStatus.READY:
         raise HTTPException(status_code=400, detail="Dataset not ready yet")
 
-    # Refresh presigned URL
-    storage_key = f"datasets/{project_id}/dataset_{project_id}.zip"
-    try:
-        fresh_url = get_presigned_url(storage_key, expiry=3600)
-        project.dataset_url = fresh_url
-        db.commit()
-    except Exception:
-        fresh_url = project.dataset_url
-
     return {
         "project_id": project_id,
-        "download_url": fresh_url,
+        "download_url": project.dataset_url,
         "image_count": project.image_count,
         "label_count": project.label_count,
         "vulnerability_vector": project.vulnerability_vector,
         "format": "COCO JSON + YOLO labels",
-        "expires_in_seconds": 3600,
     }
 
 

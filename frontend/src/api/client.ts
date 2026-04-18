@@ -50,48 +50,61 @@ export interface DatasetResponse {
   label_count: number;
   vulnerability_vector: Record<string, number>;
   format: string;
-  expires_in_seconds: number;
+  expires_in_seconds?: number;
 }
 
 // ─── Project API ─────────────────────────────────────────────────────────────
 
-export const createProject = (name: string, description?: string) =>
-  api.post<Project>("/api/projects", { name, description }).then((r) => r.data);
+export const createProject = async (name: string, description?: string) => {
+  const response = await api.post("/api/projects", { name, description });
+  return response.data as Project;
+};
 
-export const listProjects = () =>
-  api.get<Project[]>("/api/projects").then((r) => r.data);
+export const listProjects = async () => {
+  const response = await api.get("/api/projects");
+  return response.data as Project[];
+};
 
-export const getProject = (id: string) =>
-  api.get<Project>(`/api/projects/${id}`).then((r) => r.data);
+export const getProject = async (id: string) => {
+  const response = await api.get(`/api/projects/${id}`);
+  return response.data as Project;
+};
 
-export const deleteProject = (id: string) =>
-  api.delete(`/api/projects/${id}`).then((r) => r.data);
+export const deleteProject = async (id: string) => {
+  await api.delete(`/api/projects/${id}`);
+  return { deleted: true };
+};
 
-export const uploadSeedImages = (projectId: string, files: File[]) => {
-  const form = new FormData();
-  files.forEach((f) => form.append("files", f));
-  return api.post(`/api/projects/${projectId}/seed-images`, form, {
-    headers: { "Content-Type": "multipart/form-data" },
-  }).then((r) => r.data);
+export const uploadSeedImages = async (projectId: string, files: File[]) => {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file));
+  
+  const response = await api.post(`/api/projects/${projectId}/seed-images`, formData, {
+    headers: { "Content-Type": "multipart/form-data" }
+  });
+  
+  return response.data;
 };
 
 export const setModelEndpoint = (projectId: string, endpoint: string) =>
-  api.post(`/api/projects/${projectId}/model-endpoint`, { endpoint }).then((r) => r.data);
+  api.post(`/api/projects/${projectId}/model-endpoint`, { endpoint }).then((r: { data: any }) => r.data);
 
 export const trainLora = (projectId: string) =>
-  api.post(`/api/projects/${projectId}/train-lora`).then((r) => r.data);
+  api.post(`/api/projects/${projectId}/train-lora`).then((r: { data: any }) => r.data);
 
 export const runAdversarialScan = (projectId: string) =>
-  api.post<VulnerabilityResponse>(`/api/projects/${projectId}/run-adversarial-scan`).then((r) => r.data);
+  api.post<VulnerabilityResponse>(`/api/projects/${projectId}/run-adversarial-scan`).then((r: { data: VulnerabilityResponse }) => r.data);
 
 export const triggerGeneration = (projectId: string) =>
-  api.post(`/api/projects/${projectId}/generate`).then((r) => r.data);
+  api.post(`/api/projects/${projectId}/generate`).then((r: { data: any }) => r.data);
 
-export const getStatus = (projectId: string) =>
-  api.get<StatusResponse>(`/api/projects/${projectId}/status`).then((r) => r.data);
+export const getStatus = async (projectId: string): Promise<StatusResponse> => {
+  const response = await api.get(`/api/projects/${projectId}/status`);
+  return response.data;
+};
 
 export const getDataset = (projectId: string) =>
-  api.get<DatasetResponse>(`/api/projects/${projectId}/dataset`).then((r) => r.data);
+  api.get<DatasetResponse>(`/api/projects/${projectId}/dataset`).then((r: { data: DatasetResponse }) => r.data);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
